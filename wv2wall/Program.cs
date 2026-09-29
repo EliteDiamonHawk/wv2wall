@@ -200,13 +200,6 @@ internal sealed class WallpaperContext : ApplicationContext
     private readonly List<DeskForm> _forms = new();
     private readonly System.Windows.Forms.Timer _fullscreenTimer;
     private static readonly HttpClient BackendHttpClient = new();
-    private static readonly IReadOnlyDictionary<string, string> BackendTrayLabels =
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["dashboard"] = "Dashboard",
-            ["reload-theme"] = "Reload Theme",
-            ["toggle-widgets"] = "Toggle Widgets"
-        };
     private ToolStripMenuItem? _spanItem;
     private ToolStripMenuItem? _allItem;
     private ToolStripMenuItem? _pauseWhenFullscreenItem;
@@ -835,10 +828,7 @@ internal sealed class WallpaperContext : ApplicationContext
             if (string.IsNullOrWhiteSpace(actionKey) || !seenActionKeys.Add(actionKey))
                 continue;
 
-            if (!BackendTrayLabels.TryGetValue(actionKey, out string? label))
-                continue;
-
-            var item = new ToolStripMenuItem(label);
+            var item = new ToolStripMenuItem(ToBackendTrayLabel(actionKey));
             item.Click += (_, _) => _ = SendBackendTrayActionAsync(actionKey);
             _backendTrayItems.Add(item);
 
@@ -846,6 +836,17 @@ internal sealed class WallpaperContext : ApplicationContext
             int exitSeparatorIndex = _menu.Items.Count - 2;
             _menu.Items.Insert(exitSeparatorIndex, item);
         }
+    }
+
+    private static string ToBackendTrayLabel(string actionKey)
+    {
+        string[] words = actionKey
+            .Replace('-', ' ')
+            .Replace('_', ' ')
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        return string.Join(' ', words.Select(word =>
+            char.ToUpperInvariant(word[0]) + word[1..]));
     }
 
     private async Task RefreshBackendTrayActionsAsync()
