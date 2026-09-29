@@ -198,6 +198,7 @@ internal sealed class WallpaperContext : ApplicationContext
     private readonly List<ToolStripMenuItem> _monitorItems = new();
     private readonly List<ToolStripItem> _backendTrayItems = new();
     private readonly List<DeskForm> _forms = new();
+    private readonly System.Windows.Forms.Timer _fullscreenTimer;
     private static readonly HttpClient BackendHttpClient = new();
     private static readonly IReadOnlyDictionary<string, string> BackendTrayLabels =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -208,12 +209,19 @@ internal sealed class WallpaperContext : ApplicationContext
         };
     private ToolStripMenuItem? _spanItem;
     private ToolStripMenuItem? _allItem;
+    private ToolStripMenuItem? _pauseWhenFullscreenItem;
+    private ToolStripMenuItem? _suspendWallpaperItem;
     private WallpaperMode _mode = WallpaperMode.Span;
     private WallpaperMode _pendingMode = WallpaperMode.Span;
     private int _selectedMonitor;
     private int _pendingMonitor;
     private bool _switching;
     private bool _exiting;
+    private bool _pauseWhenFullscreenEnabled = true;
+    private bool _manualSuspendEnabled;
+    private bool _fullscreenForeground;
+    private bool _wallpaperSuspended;
+    private bool _suspensionTransitionInProgress;
 
     private IntPtr _mouseHook;
     private IntPtr _keyboardHook;
@@ -263,6 +271,11 @@ internal sealed class WallpaperContext : ApplicationContext
         InstallHooks();
         ApplyMode();
         _ = RefreshBackendTrayActionsAsync();
+
+        _fullscreenTimer = new System.Windows.Forms.Timer { Interval = 750 };
+        _fullscreenTimer.Tick += (_, _) => _ = UpdateFullscreenPauseStateAsync();
+        _fullscreenTimer.Start();
+        _ = UpdateFullscreenPauseStateAsync();
     }
 
 
@@ -352,6 +365,7 @@ internal sealed class WallpaperContext : ApplicationContext
     private const int LVIS_SELECTED = 0x0002;
     private const int LVIS_FOCUSED = 0x0001;
     private const int LVIF_STATE = 0x0008;
+    private const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct LVITEM
@@ -628,6 +642,40 @@ internal sealed class WallpaperContext : ApplicationContext
             _menu.Items.Add(item);
         }
 
+        _pauseWhenFullscreenItem = new ToolStripMenuItem("Pause when fullscreen")
+        {
+            CheckOnClick = true,
+            Checked = _pauseWhenFullscreenEnabled
+        };
+        _pauseWhenFullscreenItem.Click += (_, _) =>
+        {
+            _pauseWhenFullscreenEnabled = _pauseWhenFullscreenItem.Checked;
+            if (_pauseWhenFullscreenEnabled)
+            {
+                // Treat re-enabling as a fresh transition so an already-fullscreen
+                // foreground window is evaluated immediately.
+                _fullscreenForeground = false;
+                _ = UpdateFullscreenPauseStateAsync();
+            }
+            else
+            {
+                _ = UpdateWallpaperSuspensionAsync();
+            }
+        };
+        _menu.Items.Add(_pauseWhenFullscreenItem);
+
+        _suspendWallpaperItem = new ToolStripMenuItem("Suspend wallpaper")
+        {
+            CheckOnClick = true,
+            Checked = _manualSuspendEnabled
+        };
+        _suspendWallpaperItem.Click += (_, _) =>
+        {
+            _manualSuspendEnabled = _suspendWallpaperItem.Checked;
+            _ = UpdateWallpaperSuspensionAsync();
+        };
+        _menu.Items.Add(_suspendWallpaperItem);
+
         _menu.Items.Add(new ToolStripSeparator());
         AddBackendTrayItems(Array.Empty<string>());
 
@@ -636,6 +684,122 @@ internal sealed class WallpaperContext : ApplicationContext
 
         _tray.ContextMenuStrip = _menu;
         UpdateChecks();
+    }
+
+    private async Task UpdateFullscreenPauseStateAsync()
+    {
+        bool isFullscreen = IsForegroundWindowFullscreen();
+        if (isFullscreen == _fullscreenForeground)
+            return;
+
+        _fullscreenForeground = isFullscreen;
+        await UpdateWallpaperSuspensionAsync();
+    }
+
+    private Task UpdateWallpaperSuspensionAsync()
+    {
+        if (_suspensionTransitionInProgress)
+            return Task.CompletedTask;
+
+        bool shouldSuspend = _manualSuspendEnabled ||
+            (_pauseWhenFullscreenEnabled && _fullscreenForeground);
+
+        if (shouldSuspend == _wallpaperSuspended)
+            return Task.CompletedTask;
+
+        return ApplyWallpaperSuspensionAsync(shouldSuspend);
+    }
+
+    private async Task ApplyWallpaperSuspensionAsync(bool suspend)
+    {
+        _suspensionTransitionInProgress = true;
+        try
+        {
+            if (suspend)
+            {
+                if (await SuspendWallpaperAsync())
+                    _wallpaperSuspended = true;
+            }
+            else
+            {
+                ResumeWallpaper();
+            }
+        }
+        finally
+        {
+            _suspensionTransitionInProgress = false;
+        }
+    }
+
+    private async Task<bool> SuspendWallpaperAsync()
+    {
+        bool suspendedAny = false;
+        try
+        {
+            foreach (DeskForm form in _forms.ToArray())
+            {
+                if (await form.TrySuspendAsync())
+                    suspendedAny = true;
+            }
+        }
+        catch
+        {
+            // A WebView may be closing or still initializing. Keep the host running.
+        }
+
+        return suspendedAny;
+    }
+
+    private void ResumeWallpaper()
+    {
+        foreach (DeskForm form in _forms.ToArray())
+        {
+            try
+            {
+                form.Resume();
+            }
+            catch
+            {
+                // A WebView may have been disposed during a mode switch or shutdown.
+            }
+        }
+
+        _wallpaperSuspended = false;
+    }
+
+    private bool IsForegroundWindowFullscreen()
+    {
+        IntPtr foreground = GetForegroundWindow();
+        if (foreground == IntPtr.Zero || !IsWindowVisible(foreground) || IsIconic(foreground))
+            return false;
+
+        if (IsExcludedForegroundWindow(foreground) || !GetWindowRect(foreground, out RECT windowRect))
+            return false;
+
+        IntPtr monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+        var monitorInfo = new MONITORINFO { Size = Marshal.SizeOf<MONITORINFO>() };
+        if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref monitorInfo))
+            return false;
+
+        const int tolerance = 2;
+        return windowRect.Left <= monitorInfo.Monitor.Left + tolerance &&
+               windowRect.Top <= monitorInfo.Monitor.Top + tolerance &&
+               windowRect.Right >= monitorInfo.Monitor.Right - tolerance &&
+               windowRect.Bottom >= monitorInfo.Monitor.Bottom - tolerance;
+    }
+
+    private bool IsExcludedForegroundWindow(IntPtr hWnd)
+    {
+        if (hWnd == GetShellWindow())
+            return true;
+
+        GetWindowThreadProcessId(hWnd, out uint processId);
+        if (processId == (uint)Environment.ProcessId)
+            return true;
+
+        var className = new StringBuilder(256);
+        GetClassName(hWnd, className, className.Capacity);
+        return className.ToString() is "Progman" or "WorkerW";
     }
 
     private void AddBackendTrayItems(IEnumerable<string> actionKeys)
@@ -830,6 +994,7 @@ internal sealed class WallpaperContext : ApplicationContext
             if (_exiting && _forms.Count == 0)
             {
                 UninstallHooks();
+                _fullscreenTimer.Dispose();
                 _tray.Visible = false;
                 _tray.Dispose();
                 ExitThread();
@@ -858,6 +1023,8 @@ internal sealed class WallpaperContext : ApplicationContext
     private void Exit()
     {
         _exiting = true;
+        _fullscreenTimer.Stop();
+        _fullscreenTimer.Dispose();
         foreach (var form in _forms.ToArray())
         {
             form.Close();
@@ -908,6 +1075,24 @@ internal sealed class WallpaperContext : ApplicationContext
         public uint flags;
         public uint time;
         public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MONITORINFO
+    {
+        public int Size;
+        public RECT Monitor;
+        public RECT Work;
+        public uint Flags;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -993,6 +1178,24 @@ internal sealed class WallpaperContext : ApplicationContext
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetShellWindow();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint dwFlags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsIconic(IntPtr hWnd);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -1085,6 +1288,29 @@ public sealed class DeskForm : Form
         catch
         {
         }
+    }
+
+    public async Task<bool> TrySuspendAsync()
+    {
+        if (_closing || _wv.IsDisposed || _wv.CoreWebView2 == null)
+            return false;
+
+        try
+        {
+            return await _wv.CoreWebView2.TrySuspendAsync();
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public void Resume()
+    {
+        if (_closing || _wv.IsDisposed || _wv.CoreWebView2 == null)
+            return;
+
+        _wv.CoreWebView2.Resume();
     }
 
     public void PostKey(int msg, int vkCode, int scanCode, int flags)
