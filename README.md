@@ -46,6 +46,7 @@ Or run the built executable from `bin\Release\...`.
     - **Span**: one surface across the entire virtual screen
     - **All monitors**: one surface per monitor
     - **Monitor N**: single monitor wallpaper
+  - Use **Reload WebView2** to reload all active wallpaper surfaces.
 
 Keyboard focus behavior:
 - Clicking the desktop background (not an icon) sets “wallpaper focused” and forwards keys to the web app.

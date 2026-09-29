@@ -676,6 +676,8 @@ internal sealed class WallpaperContext : ApplicationContext
         };
         _menu.Items.Add(_suspendWallpaperItem);
 
+        _menu.Items.Add(new ToolStripMenuItem("Reload WebView2", null, (_, _) => ReloadWebViews()));
+
         _menu.Items.Add(new ToolStripSeparator());
         AddBackendTrayItems(Array.Empty<string>());
 
@@ -684,6 +686,21 @@ internal sealed class WallpaperContext : ApplicationContext
 
         _tray.ContextMenuStrip = _menu;
         UpdateChecks();
+    }
+
+    private void ReloadWebViews()
+    {
+        foreach (DeskForm form in _forms.ToArray())
+        {
+            try
+            {
+                form.ReloadWebView();
+            }
+            catch
+            {
+                // A WebView may still be initializing or closing.
+            }
+        }
     }
 
     private async Task UpdateFullscreenPauseStateAsync()
@@ -1311,6 +1328,14 @@ public sealed class DeskForm : Form
             return;
 
         _wv.CoreWebView2.Resume();
+    }
+
+    public void ReloadWebView()
+    {
+        if (_closing || _wv.IsDisposed || _wv.CoreWebView2 == null)
+            return;
+
+        _wv.CoreWebView2.Reload();
     }
 
     public void PostKey(int msg, int vkCode, int scanCode, int flags)
