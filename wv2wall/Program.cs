@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Web.WebView2.WinForms;
 
 internal static class Program
@@ -68,8 +70,8 @@ internal sealed class WallpaperContext : ApplicationContext
     private IntPtr _keyboardHook;
     private LowLevelMouseProc? _mouseProc;
     private LowLevelKeyboardProc? _keyboardProc;
-    private bool _isWallpaperFocused = true;
-    private bool _isInteractingWithDesktop = false;
+    private readonly KeyboardOwnership<DeskForm> _keyboardOwnership = new();
+    private bool _isInteractingWithDesktop;
 
     // Hook constants
     private const int WH_KEYBOARD_LL = 13;
@@ -85,10 +87,10 @@ internal sealed class WallpaperContext : ApplicationContext
     private const int WM_MOUSEWHEEL = 0x020A;
     private const int WM_MOUSEHWHEEL = 0x020E;
 
-    private const int WM_KEYDOWN = 0x0100;
-    private const int WM_KEYUP = 0x0101;
-    private const int WM_SYSKEYDOWN = 0x0104;
-    private const int WM_SYSKEYUP = 0x0105;
+    private const int WM_KEYDOWN = KeyboardInputPolicy.WmKeyDown;
+    private const int WM_KEYUP = KeyboardInputPolicy.WmKeyUp;
+    private const int WM_SYSKEYDOWN = KeyboardInputPolicy.WmSysKeyDown;
+    private const int WM_SYSKEYUP = KeyboardInputPolicy.WmSysKeyUp;
     private const int WM_CANCELMODE = 0x001F;
     private const int WM_CLOSE = 0x0010;
 
@@ -207,6 +209,9 @@ internal sealed class WallpaperContext : ApplicationContext
         if (_exiting || _fullscreenMonitoringDisposed)
             return;
 
+        if (eventType == EVENT_SYSTEM_FOREGROUND && !IsDesktopForegroundWindow(hwnd))
+            EndBackgroundKeyboardInteraction("foreground changed");
+
         if (eventType == EVENT_OBJECT_LOCATIONCHANGE &&
             (hwnd == IntPtr.Zero || idObject != OBJID_WINDOW || idChild != CHILDID_SELF))
         {
@@ -263,57 +268,150 @@ internal sealed class WallpaperContext : ApplicationContext
 
     private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode >= 0 && _isWallpaperFocused)
+        if (nCode < 0 || !KeyboardInputPolicy.IsKeyboardMessage((int)wParam))
+            return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+
+        var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+        int msg = (int)wParam;
+        int vk = (int)info.vkCode;
+
+        if (!TryGetBackgroundKeyboardTarget(out DeskForm? target))
+            return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+
+        if (!IsDesktopForegroundWindow(GetForegroundWindow()))
         {
-            int msg = (int)wParam;
-            if (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)
-            {
-                var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-                int vk = (int)info.vkCode;
-
-                // 1. ALWAYS PASS-THROUGH CRITICAL SYSTEM KEYS
-                // VK_LWIN(0x5B), VK_RWIN(0x5C), VK_SNAPSHOT(0x2C)
-                if (vk == 0x5B || vk == 0x5C || vk == 0x2C)
-                {
-                    if (_forms.Count > 0) _forms[0].PostKey(msg, vk, (int)info.scanCode, (int)info.flags);
-                    return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
-                }
-
-                // 2. HANDLE ALT+TAB
-                // VK_TAB = 0x09
-                if (vk == 0x09)
-                {
-                    bool altDown = (GetKeyState(0x12) & 0x8000) != 0; // VK_MENU
-                    if (altDown)
-                    {
-                        return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
-                    }
-                }
-
-                // 3. HANDLE MODIFIERS (Shift, Ctrl, Alt, CapsLock)
-                // Pass to OS AND WebView
-                // VK_SHIFT(0x10), VK_CONTROL(0x11), VK_MENU(0x12), VK_CAPITAL(0x14)
-                if (vk == 0x10 || vk == 0x11 || vk == 0x12 || vk == 0x14 ||
-                    vk == 0xA0 || vk == 0xA1 || vk == 0xA2 || vk == 0xA3 || vk == 0xA4 || vk == 0xA5)
-                {
-                    if (_forms.Count > 0) _forms[0].PostKey(msg, vk, (int)info.scanCode, (int)info.flags);
-                    return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
-                }
-
-                // 4. CONTENT KEYS
-                if (_forms.Count > 0)
-                {
-                    _forms[0].PostKey(msg, vk, (int)info.scanCode, (int)info.flags);
-                    return (IntPtr)1; // Swallow
-                }
-            }
+            EndBackgroundKeyboardInteraction("foreground validation failed");
+            return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
         }
 
-        return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+        bool altDown = (GetAsyncKeyState(KeyboardInputPolicy.VkMenu) & 0x8000) != 0;
+        bool winDown = (GetAsyncKeyState(KeyboardInputPolicy.VkLWin) & 0x8000) != 0 ||
+                       (GetAsyncKeyState(KeyboardInputPolicy.VkRWin) & 0x8000) != 0;
+        bool ctrlDown = (GetAsyncKeyState(KeyboardInputPolicy.VkControl) & 0x8000) != 0;
+        if (KeyboardInputPolicy.IsSystemOwnedKey(msg, vk, altDown, winDown, ctrlDown))
+        {
+            if (KeyboardInputPolicy.EndsOwnership(msg, vk, altDown, winDown, ctrlDown))
+                EndBackgroundKeyboardInteraction(GetSystemKeyEndReason(vk, altDown));
+            return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+        }
+
+        target!.PostKey(msg, vk, (int)info.scanCode, (int)info.flags);
+        TrackForwardedKeyboardKey(msg, vk, (int)info.scanCode, (int)info.flags);
+        return (IntPtr)1;
     }
 
-    [DllImport("user32.dll")]
-    private static extern short GetKeyState(int nVirtKey);
+    private string GetSystemKeyEndReason(int virtualKey, bool altDown)
+    {
+        if (virtualKey == KeyboardInputPolicy.VkTab && altDown)
+            return "Alt+Tab";
+
+        return virtualKey switch
+        {
+            KeyboardInputPolicy.VkLWin or KeyboardInputPolicy.VkRWin => "Win key",
+            KeyboardInputPolicy.VkEscape => "Escape",
+            KeyboardInputPolicy.VkSnapshot => "PrintScreen",
+            KeyboardInputPolicy.VkApps => "system key",
+            _ => "Alt/system key"
+        };
+    }
+
+    private bool TryGetBackgroundKeyboardTarget(out DeskForm? target)
+    {
+        if (!_keyboardOwnership.TryGetTarget(out target))
+            return false;
+
+        if (target!.IsDisposed || !_forms.Contains(target))
+        {
+            EndBackgroundKeyboardInteraction("renderer unavailable");
+            target = null;
+            return false;
+        }
+
+        return true;
+    }
+
+    private void BeginBackgroundKeyboardInteraction(DeskForm form)
+    {
+        if (_exiting || form.IsDisposed || !_forms.Contains(form) ||
+            !IsDesktopForegroundWindow(GetForegroundWindow()))
+        {
+            return;
+        }
+
+        if (_keyboardOwnership.TryGetTarget(out DeskForm? existingTarget) &&
+            !ReferenceEquals(existingTarget, form))
+        {
+            EndBackgroundKeyboardInteraction("renderer target changed");
+        }
+
+        _keyboardOwnership.Arm(form, out _);
+        if (_keyboardOwnership.Begin(form, KeyboardFocusKind.Editable, out _))
+        {
+            Debug.WriteLine($"Background keyboard interaction started: monitor={form.MonitorHandle}");
+        }
+    }
+
+    private void EndBackgroundKeyboardInteraction(string reason)
+    {
+        if (_keyboardOwnership.End(out DeskForm? target, out KeyValuePair<int, ForwardedKeyboardKey>[] keys))
+        {
+            EndForwardedKeyboardKeys(target, keys);
+            Debug.WriteLine($"Background keyboard interaction ended: {reason}");
+        }
+    }
+
+    private void EndForwardedKeyboardKeys(DeskForm? target, KeyValuePair<int, ForwardedKeyboardKey>[] keys)
+    {
+        if (target == null)
+            return;
+
+        foreach (var entry in keys)
+        {
+            try
+            {
+                target.PostKey(WM_KEYUP, entry.Key, entry.Value.ScanCode, entry.Value.Flags | 0x80);
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+        }
+    }
+
+    private void TrackForwardedKeyboardKey(int message, int virtualKey, int scanCode, int flags)
+    {
+        _keyboardOwnership.Track(message, virtualKey, scanCode, flags);
+    }
+
+    private void OnRendererKeyboardInteractionChanged(DeskForm form, bool wantsKeyboard)
+    {
+        if (wantsKeyboard)
+            BeginBackgroundKeyboardInteraction(form);
+        else
+        {
+            if (!_keyboardOwnership.HasTarget(form))
+                return;
+
+            EndBackgroundKeyboardInteraction("renderer focus ended");
+        }
+    }
+
+    private bool IsDesktopForegroundWindow(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero)
+            return false;
+
+        if (hwnd == GetShellWindow())
+            return true;
+
+        IntPtr root = GetAncestor(hwnd, GetAncestorFlags.GetRoot);
+        if (root == IntPtr.Zero)
+            root = hwnd;
+
+        var className = new StringBuilder(256);
+        GetClassName(root, className, className.Capacity);
+        return className.ToString() is "Progman" or "WorkerW" or "SHELLDLL_DefView" or "SysListView32";
+    }
 
     private const int LVM_SETITEMSTATE = 0x1000 + 43;
     private const int LVIS_SELECTED = 0x0002;
@@ -406,6 +504,8 @@ internal sealed class WallpaperContext : ApplicationContext
             {
                 if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP)
                 {
+                    if (msg == WM_RBUTTONDOWN)
+                        EndBackgroundKeyboardInteraction("desktop right-click");
                     return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
                 }
 
@@ -413,11 +513,12 @@ internal sealed class WallpaperContext : ApplicationContext
                 {
                     if (IsOverDesktopIcon(hWndUnderMouse, pt))
                     {
+                        EndBackgroundKeyboardInteraction("desktop icon interaction");
                         _isInteractingWithDesktop = true;
                         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
                     }
 
-                    _isWallpaperFocused = true;
+                    EndBackgroundKeyboardInteraction("desktop background mouse interaction");
                     DeselectDesktopIcons(hWndUnderMouse);
 
                     PostMessage(GetShellWindow(), WM_CANCELMODE, IntPtr.Zero, IntPtr.Zero);
@@ -431,7 +532,7 @@ internal sealed class WallpaperContext : ApplicationContext
 
                 if (msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN)
                 {
-                    _isWallpaperFocused = true;
+                    EndBackgroundKeyboardInteraction("desktop mouse interaction");
                 }
 
                 DeskForm? targetForm = null;
@@ -475,7 +576,7 @@ internal sealed class WallpaperContext : ApplicationContext
             {
                 if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN)
                 {
-                    _isWallpaperFocused = false;
+                    EndBackgroundKeyboardInteraction("outside background");
                 }
             }
         }
@@ -713,6 +814,7 @@ internal sealed class WallpaperContext : ApplicationContext
 
                     if (shouldSuspend)
                     {
+                        EndBackgroundKeyboardInteraction("wallpaper suspended");
                         if (!form.RendererSuspended && await form.TrySuspendAsync())
                             form.RendererSuspended = true;
                     }
@@ -780,7 +882,7 @@ internal sealed class WallpaperContext : ApplicationContext
 
         var className = new StringBuilder(256);
         GetClassName(hWnd, className, className.Capacity);
-        return className.ToString() is "Progman" or "WorkerW";
+        return className.ToString() is "Progman" or "WorkerW" or "SHELLDLL_DefView" or "SysListView32";
     }
 
     private void AskForUrl()
@@ -813,6 +915,8 @@ internal sealed class WallpaperContext : ApplicationContext
     {
         var screens = Screen.AllScreens;
         if (screens.Length == 0) return;
+
+        EndBackgroundKeyboardInteraction("wallpaper mode changed");
 
         if (_selectedMonitor >= screens.Length) _selectedMonitor = 0;
 
@@ -878,6 +982,7 @@ internal sealed class WallpaperContext : ApplicationContext
     private DeskForm CreateForm(Rectangle targetBounds, Rectangle virtualBounds, IntPtr monitorHandle)
     {
         var form = new DeskForm(_url, _scriptContent, targetBounds, virtualBounds, monitorHandle);
+        form.KeyboardInteractionChanged += OnRendererKeyboardInteractionChanged;
         form.FormClosed += OnFormClosed;
         form.Show();
         return form;
@@ -887,6 +992,8 @@ internal sealed class WallpaperContext : ApplicationContext
     {
         if (sender is DeskForm form)
         {
+            EndBackgroundKeyboardInteraction("renderer closed");
+            form.KeyboardInteractionChanged -= OnRendererKeyboardInteractionChanged;
             _forms.Remove(form);
             form.Dispose();
             if (_exiting && _forms.Count == 0)
@@ -921,6 +1028,7 @@ internal sealed class WallpaperContext : ApplicationContext
     private void Exit()
     {
         _exiting = true;
+        EndBackgroundKeyboardInteraction("application exiting");
         DisposeFullscreenMonitoring();
         foreach (var form in _forms.ToArray())
         {
@@ -1171,6 +1279,47 @@ public sealed class DeskForm : Form
     private bool _closing;
     private const int HR_RESOURCE_NOT_READY = unchecked((int)0x8007139F);
 
+    internal event Action<DeskForm, bool>? KeyboardInteractionChanged;
+
+    private const string KeyboardFocusScript = """
+        (() => {
+            let lastState = null;
+
+            function post(state) {
+                if (lastState === state) return;
+                lastState = state;
+                if (window.chrome && window.chrome.webview) {
+                    window.chrome.webview.postMessage({
+                        type: "wv2wall-keyboard-focus",
+                        enabled: state
+                    });
+                }
+            }
+
+            function isKeyboardTarget(element) {
+                if (!element) return false;
+                if (element.isContentEditable) return true;
+                if (element.matches("[data-wv2wall-keyboard-input]")) return true;
+                if (element.getAttribute("role") === "textbox") return true;
+                if (element instanceof HTMLTextAreaElement) return true;
+                if (element instanceof HTMLInputElement) {
+                    return !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(element.type);
+                }
+                return false;
+            }
+
+            function report() {
+                post(isKeyboardTarget(document.activeElement));
+            }
+
+            document.addEventListener("focusin", report, true);
+            document.addEventListener("focusout", () => setTimeout(report, 0), true);
+            document.addEventListener("pointerup", () => setTimeout(report, 0), true);
+            window.addEventListener("blur", () => post(false));
+            report();
+        })();
+        """;
+
     public DeskForm(
         string url,
         string scriptContent,
@@ -1206,6 +1355,7 @@ public sealed class DeskForm : Form
         {
             _closing = true;
             _initCts.Cancel();
+            KeyboardInteractionChanged?.Invoke(this, false);
             if (!_wv.IsDisposed) _wv.Dispose();
         };
     }
@@ -1273,25 +1423,6 @@ public sealed class DeskForm : Form
         newLParam |= (long)scanCode << 16;
         if (extended) newLParam |= 1L << 24;
 
-        // Handling Shortcuts (Alt+Key):
-        // If we receive WM_SYSKEYDOWN (Alt+Key), we want to convert it to WM_KEYDOWN
-        // so the browser sees it as a "Content" keystroke (e.g. shortcut) instead of "System" (Menu).
-        // HOWEVER, we must be careful:
-        // 1. If we send WM_KEYDOWN with bit 29 (Alt) SET, Chrome treats it as Alt+Key. Correct.
-        // 2. If we send WM_SYSKEYDOWN, Chrome treats it as Menu access. Incorrect for web apps.
-
-        int finalMsg = msg;
-
-        if (msg == 0x0104) // WM_SYSKEYDOWN
-        {
-            finalMsg = 0x0100; // WM_KEYDOWN
-            // We KEEP bit 29 set in lParam to indicate Alt is held.
-        }
-        else if (msg == 0x0105) // WM_SYSKEYUP
-        {
-            finalMsg = 0x0101; // WM_KEYUP
-        }
-
         // Apply Alt bit (Bit 29)
         if (altDown) newLParam |= 1L << 29;
 
@@ -1318,7 +1449,7 @@ public sealed class DeskForm : Form
             // We can just check the 'up' flag from the hook, which is 0 for down.
         }
 
-        PostMessage(wvHwnd, finalMsg, (IntPtr)vkCode, (IntPtr)newLParam);
+        PostMessage(wvHwnd, msg, (IntPtr)vkCode, (IntPtr)newLParam);
     }
 
     [DllImport("user32.dll")]
@@ -1360,10 +1491,17 @@ public sealed class DeskForm : Form
                 _wv.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
                 _wv.CoreWebView2.Settings.AreDevToolsEnabled = false;
 
+                _wv.CoreWebView2.NavigationStarting += (_, _) =>
+                    KeyboardInteractionChanged?.Invoke(this, false);
+                _wv.CoreWebView2.WebMessageReceived += (_, args) =>
+                    HandleWebMessage(args.WebMessageAsJson);
+
                 if (!string.IsNullOrWhiteSpace(_scriptContent))
                 {
                     await _wv.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(_scriptContent);
                 }
+
+                await _wv.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(KeyboardFocusScript);
 
                 _wv.CoreWebView2.Navigate(_url);
                 return;
@@ -1384,6 +1522,27 @@ public sealed class DeskForm : Form
             {
                 return;
             }
+        }
+    }
+
+    private void HandleWebMessage(string message)
+    {
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(message);
+            JsonElement root = document.RootElement;
+            if (!root.TryGetProperty("type", out JsonElement type) ||
+                type.GetString() != "wv2wall-keyboard-focus" ||
+                !root.TryGetProperty("enabled", out JsonElement enabled))
+            {
+                return;
+            }
+
+            KeyboardInteractionChanged?.Invoke(this, enabled.GetBoolean());
+        }
+        catch (JsonException)
+        {
+            // Ignore messages that are not generated by our injected script.
         }
     }
 
